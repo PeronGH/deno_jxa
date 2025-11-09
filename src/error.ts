@@ -27,3 +27,20 @@ export class ReplExecutionError extends JXAError {
     this.name = "ReplExecutionError";
   }
 }
+
+export class BufferOverflowError extends JXAError {
+  constructor(message: string) {
+    super(message);
+    this.name = "BufferOverflowError";
+  }
+}
+
+export class NotSerializableError extends JXAError {
+  constructor(
+    message: string,
+    public readonly originalOutput: string,
+  ) {
+    super(message);
+    this.name = "NotSerializableError";
+  }
+}

@@ -1,115 +1,209 @@
-import { TextLineStream } from "@std/streams";
 import {
+  BufferOverflowError,
   MultiLineCodeError,
+  NotSerializableError,
   ReplExecutionError,
   StreamEndedError,
 } from "./error.ts";
+import { RESULT_BUFFER_SIZE } from "./constants.ts";
 
-class JXASession implements AsyncDisposable {
-  #process: Deno.ChildProcess;
-  #writer: WritableStreamDefaultWriter<string>;
-  #lineReader: ReadableStreamDefaultReader<string>;
+const sessionSymbol = Symbol("session");
+const varNameSymbol = Symbol("varName");
+const thisContextSymbol = Symbol("thisContext");
+
+type Handle = ((...args: unknown[]) => unknown) & {
+  [sessionSymbol]: JXASession;
+  [varNameSymbol]: string;
+  [thisContextSymbol]?: string;
+};
+
+class JXASession implements Disposable {
+  #worker: Worker;
 
   constructor() {
-    // Use script to provide a PTY for proper line buffering
-    const command = new Deno.Command("/usr/bin/script", {
-      args: ["-q", "/dev/null", "/usr/bin/osascript", "-l", "JavaScript", "-i"],
-      stdin: "piped",
-      stdout: "piped", // REPL result
-      stderr: "null", // Discard console.log output
-    });
-
-    this.#process = command.spawn();
-
-    // Set up stdin with TextEncoderStream
-    const { writable, readable } = new TextEncoderStream();
-    readable.pipeTo(this.#process.stdin).catch(() => {
-      // Ignore pipe errors on cleanup
-    });
-    this.#writer = writable.getWriter();
-
-    // Set up stdout reader
-    this.#lineReader = this.#process.stdout
-      .pipeThrough(new TextDecoderStream())
-      .pipeThrough(new TextLineStream())
-      .getReader();
+    this.#worker = new Worker(
+      new URL("./session_worker.ts", import.meta.url).href,
+      {
+        type: "module",
+      },
+    );
   }
 
-  async execute(code: string): Promise<string> {
-    const trimmedCode = code.trim();
-    if (trimmedCode.includes("\n")) {
-      throw new MultiLineCodeError();
+  #sendMessage(type: string, data: string): string {
+    // SharedArrayBuffer layout: [0-3]: ready flag, [4-7]: status (1=success, 2=error), [8+]: result string
+    const sab = new SharedArrayBuffer(8 + RESULT_BUFFER_SIZE);
+    const int32 = new Int32Array(sab);
+    Atomics.store(int32, 0, 0);
+
+    this.#worker.postMessage({ type, data, sab });
+
+    Atomics.wait(int32, 0, 0);
+
+    const status = Atomics.load(int32, 1);
+
+    const resultBuffer = new Uint8Array(sab, 8);
+    const decoder = new TextDecoder();
+    let resultLength = 0;
+    while (
+      resultLength < resultBuffer.length && resultBuffer[resultLength] !== 0
+    ) {
+      resultLength++;
+    }
+    const result = decoder.decode(resultBuffer.slice(0, resultLength));
+
+    if (status === 2) {
+      let errorData: { type: string; message: string };
+      try {
+        errorData = JSON.parse(result);
+      } catch {
+        throw new Error(result);
+      }
+
+      if (errorData.type === "MultiLineCodeError") {
+        throw new MultiLineCodeError();
+      } else if (errorData.type === "ReplExecutionError") {
+        throw new ReplExecutionError(errorData.message);
+      } else if (errorData.type === "BufferOverflowError") {
+        throw new BufferOverflowError(errorData.message);
+      } else {
+        throw new Error(errorData.message);
+      }
     }
 
-    await this.#writer.ready;
-    await this.#writer.write(`${trimmedCode}\n\n`);
+    return result;
+  }
 
-    let result: string | null = null;
-    let isError = false;
+  #createVar(expression: string): string {
+    return this.#sendMessage("createVar", expression);
+  }
 
-    while (true) {
-      const { value: line, done } = await this.#lineReader.read();
-      if (done) throw new StreamEndedError();
+  #handle(varName: string): Handle {
+    const handle = (() => {}) as Handle;
+    handle[sessionSymbol] = this;
+    handle[varNameSymbol] = varName;
 
-      // Skip echo of the command and empty newline
-      if (result === null && line.startsWith(">> ")) {
-        continue;
-      }
+    const proxyHandler: ProxyHandler<Handle> = {
+      get(target, prop) {
+        if (typeof prop === "symbol") {
+          return target[prop as keyof Handle];
+        }
 
-      // Skip console.log output and other non-result lines before we have a result
-      if (
-        result === null && !line.startsWith("=> ") && !line.startsWith("!! ")
-      ) {
-        continue;
-      }
+        const session = target[sessionSymbol];
+        const currentVarName = target[varNameSymbol];
 
-      // Parse result line
-      if (line.startsWith("=> ")) {
-        if (result === null) {
-          // This is our result
-          result = line.slice(3);
-          isError = false;
-          continue;
+        const newVarName = session.#createVar(
+          `Reflect.get(${currentVarName}, ${JSON.stringify(prop)})`,
+        );
+
+        const newHandle = (() => {}) as Handle;
+        newHandle[sessionSymbol] = session;
+        newHandle[varNameSymbol] = newVarName;
+        newHandle[thisContextSymbol] = currentVarName;
+
+        return new Proxy(newHandle, proxyHandler);
+      },
+      apply(target, _thisArg, args) {
+        const session = target[sessionSymbol];
+        const fnVarName = target[varNameSymbol];
+        const thisContext = target[thisContextSymbol];
+
+        const argStrings = args.map((arg) => {
+          if (session.owns(arg)) {
+            return (arg as Handle)[varNameSymbol];
+          }
+          return JSON.stringify(arg);
+        });
+
+        const thisArg = thisContext ?? "undefined";
+        const callExpr = `Reflect.apply(${fnVarName}, ${thisArg}, [${
+          argStrings.join(", ")
+        }])`;
+        const resultVarName = session.#createVar(callExpr);
+
+        return session.#handle(resultVarName);
+      },
+      set(target, prop, value) {
+        if (typeof prop === "symbol") {
+          return false;
+        }
+
+        const session = target[sessionSymbol];
+        const currentVarName = target[varNameSymbol];
+
+        let valueString: string;
+        if (session.owns(value)) {
+          valueString = (value as Handle)[varNameSymbol];
+        } else if (typeof value === "function") {
+          valueString = `(${value.toString()})`;
         } else {
-          // This is the result of the empty command we sent, skip it
-          continue;
+          valueString = JSON.stringify(value);
         }
-      }
 
-      if (line.startsWith("!! ")) {
-        if (result === null) {
-          result = line.slice(3);
-          isError = true;
-          continue;
-        } else {
-          // Result of empty command, skip
-          continue;
-        }
-      }
+        session.unsafeExecute(
+          `Reflect.set(${currentVarName}, ${
+            JSON.stringify(prop)
+          }, ${valueString})`,
+        );
 
-      // Prompt for the empty command means we're done
-      if (line.startsWith(">> ") && result !== null) {
-        if (isError) {
-          throw new ReplExecutionError(result);
-        }
-        return result;
-      }
+        return true;
+      },
+    };
 
-      // Multi-line continuation
-      if (result !== null) {
-        result += `\n${line}`;
+    return new Proxy(handle, proxyHandler);
+  }
+
+  owns(handle: unknown): boolean {
+    return (typeof handle === "object" || typeof handle === "function") &&
+      handle !== null &&
+      sessionSymbol in handle &&
+      (handle as Handle)[sessionSymbol] === this;
+  }
+
+  // deno-lint-ignore no-explicit-any
+  unwrap(handle: unknown): any {
+    if (!this.owns(handle)) {
+      throw new TypeError("Handle does not belong to this session");
+    }
+
+    const varName = (handle as Handle)[varNameSymbol];
+
+    const output = this.unsafeExecute(varName);
+
+    try {
+      return JSON.parse(output);
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        throw new NotSerializableError(
+          `Value is not JSON serializable`,
+          output,
+        );
       }
+      throw error;
     }
   }
 
-  async [Symbol.asyncDispose](): Promise<void> {
-    this.#lineReader.releaseLock();
-    await this.#writer.close();
-    await this.#process[Symbol.asyncDispose]();
+  unsafeExecute(code: string): string {
+    return this.#sendMessage("execute", code);
+  }
+
+  // deno-lint-ignore no-explicit-any
+  get globalThis(): any {
+    return this.#handle("globalThis");
+  }
+
+  [Symbol.dispose](): void {
+    this.#sendMessage("dispose", "");
+    this.#worker.terminate();
   }
 }
 
 export type { JXASession };
-export { MultiLineCodeError, ReplExecutionError, StreamEndedError };
+export {
+  BufferOverflowError,
+  MultiLineCodeError,
+  NotSerializableError,
+  ReplExecutionError,
+  StreamEndedError,
+};
 
 export const session = () => new JXASession();
