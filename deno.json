@@ -2,5 +2,10 @@
   "name": "deno_jxa",
   "version": "0.1.0",
   "exports": "./mod.ts",
-  "license": "MIT"
+  "license": "MIT",
+  "imports": {
+    "@sigma/pty-ffi": "jsr:@sigma/pty-ffi@^0.39.1",
+    "@std/assert": "jsr:@std/assert@^1.0.15",
+    "@std/streams": "jsr:@std/streams@^1.0.13"
+  }
 }
