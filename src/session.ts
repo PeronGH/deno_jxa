@@ -11,10 +11,11 @@ const sessionSymbol = Symbol("session");
 const varNameSymbol = Symbol("varName");
 const thisContextSymbol = Symbol("thisContext");
 
-type Handle = ((...args: unknown[]) => unknown) & {
+type Handle = ((...args: unknown[]) => Handle) & {
   [sessionSymbol]: JXASession;
   [varNameSymbol]: string;
   [thisContextSymbol]?: string;
+  [key: string]: Handle;
 };
 
 class JXASession implements Disposable {
@@ -152,15 +153,30 @@ class JXASession implements Disposable {
     return new Proxy(handle, proxyHandler);
   }
 
-  owns(handle: unknown): boolean {
-    return (typeof handle === "object" || typeof handle === "function") &&
-      handle !== null &&
+  owns(handle: Handle): boolean {
+    return (typeof handle === "function") &&
       sessionSymbol in handle &&
       (handle as Handle)[sessionSymbol] === this;
   }
 
+  wrap(value: unknown): Handle {
+    let valueString: string;
+    if (this.owns(value as Handle)) {
+      return value as Handle;
+    } else if (typeof value === "function") {
+      valueString = `(${
+        (value as (...args: unknown[]) => unknown).toString()
+      })`;
+    } else {
+      valueString = JSON.stringify(value);
+    }
+
+    const varName = this.#createVar(valueString);
+    return this.#handle(varName);
+  }
+
   // deno-lint-ignore no-explicit-any
-  unwrap(handle: unknown): any {
+  unwrap(handle: Handle): any {
     if (!this.owns(handle)) {
       throw new TypeError("Handle does not belong to this session");
     }
@@ -186,8 +202,7 @@ class JXASession implements Disposable {
     return this.#sendMessage("execute", code);
   }
 
-  // deno-lint-ignore no-explicit-any
-  get globalThis(): any {
+  get globalThis(): Handle {
     return this.#handle("globalThis");
   }
 

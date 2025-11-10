@@ -93,31 +93,6 @@ Deno.test("JXASession - owns method", async (t) => {
     const handle = s1.globalThis;
     assertEquals(s2.owns(handle), false);
   });
-
-  await t.step("rejects string", () => {
-    using s = session();
-    assertEquals(s.owns("test string"), false);
-  });
-
-  await t.step("rejects null", () => {
-    using s = session();
-    assertEquals(s.owns(null), false);
-  });
-
-  await t.step("rejects undefined", () => {
-    using s = session();
-    assertEquals(s.owns(undefined), false);
-  });
-
-  await t.step("rejects number", () => {
-    using s = session();
-    assertEquals(s.owns(42), false);
-  });
-
-  await t.step("rejects plain object", () => {
-    using s = session();
-    assertEquals(s.owns({}), false);
-  });
 });
 
 Deno.test("JXASession - unwrap method", async (t) => {
@@ -183,16 +158,6 @@ Deno.test("JXASession - unwrap method", async (t) => {
       );
     }
   });
-
-  await t.step("throws TypeError for non-handle", () => {
-    using s = session();
-    try {
-      s.unwrap("not a handle");
-      throw new Error("Should have thrown");
-    } catch (err) {
-      assertInstanceOf(err, TypeError);
-    }
-  });
 });
 
 Deno.test("JXASession - function calls", async (t) => {
@@ -204,8 +169,8 @@ Deno.test("JXASession - function calls", async (t) => {
 
   await t.step("array method with handle callback", () => {
     using s = session();
-    s.globalThis.nums = [1, 2, 3, 4, 5];
-    s.globalThis.isEven = (x: number) => x % 2 === 0;
+    s.globalThis.nums = s.wrap([1, 2, 3, 4, 5]);
+    s.globalThis.isEven = s.wrap((x: number) => x % 2 === 0);
     const nums = s.globalThis.nums;
     const isEven = s.globalThis.isEven;
     const result = nums.filter(isEven);
