@@ -139,13 +139,13 @@ class JXASession implements Disposable {
           valueString = JSON.stringify(value);
         }
 
-        session.unsafeExecute(
+        const result = session.unsafeExecute(
           `Reflect.set(${currentVarName}, ${
             JSON.stringify(prop)
           }, ${valueString})`,
         );
 
-        return true;
+        return result === "true";
       },
     };
 
