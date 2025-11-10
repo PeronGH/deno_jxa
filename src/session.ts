@@ -131,19 +131,13 @@ class JXASession implements Disposable {
         const session = target[sessionSymbol];
         const currentVarName = target[varNameSymbol];
 
-        let valueString: string;
-        if (session.owns(value)) {
-          valueString = (value as Handle)[varNameSymbol];
-        } else if (typeof value === "function") {
-          valueString = `(${value.toString()})`;
-        } else {
-          valueString = JSON.stringify(value);
-        }
+        const valueHandle = session.wrap(value);
+        const valueVarName = valueHandle[varNameSymbol];
 
         const result = session.unsafeExecute(
           `Reflect.set(${currentVarName}, ${
             JSON.stringify(prop)
-          }, ${valueString})`,
+          }, ${valueVarName})`,
         );
 
         return result === "true";
@@ -164,9 +158,7 @@ class JXASession implements Disposable {
     if (this.owns(value as Handle)) {
       return value as Handle;
     } else if (typeof value === "function") {
-      valueString = `(${
-        (value as (...args: unknown[]) => unknown).toString()
-      })`;
+      valueString = `(${value.toString()})`;
     } else {
       valueString = JSON.stringify(value);
     }
